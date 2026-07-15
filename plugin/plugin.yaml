@@ -1,0 +1,3 @@
+name: personal-memo
+version: "2.1.0"
+description: Persistent personal memo tools backed by the personal-memo SQLite database.

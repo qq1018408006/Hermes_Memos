@@ -1,0 +1,4 @@
+interface:
+  display_name: "Personal Memo"
+  short_description: "Persistent private memos, tasks, links, and exact reminders"
+  default_prompt: "Use $personal-memo to save a task with a reminder and show my active list."

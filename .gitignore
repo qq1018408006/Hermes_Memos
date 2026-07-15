@@ -1,0 +1,49 @@
+# Python bytecode and test/cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments and local packaging output
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Hermes runtime and personal data
+.hermes/
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+backups/
+exports/
+logs/
+
+# Generated/local plugin and MCP state
+plugin/**/__pycache__/
+mcp/**/__pycache__/
+skill/**/__pycache__/
+
+# Editors and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
