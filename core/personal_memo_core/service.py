@@ -35,7 +35,7 @@ from typing import Any, Iterable, Iterator, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 SNAPSHOT_TTL_HOURS = 24
 MAX_FETCH_BYTES = 524_288
@@ -79,15 +79,25 @@ SENSITIVE_PATTERNS = (
 )
 URL_RE = re.compile(r"https?://[^\s<>\]\[(){}\"']+", re.I)
 
-MORNING_PROMPT = """加载 personal-memo skill，以早间提醒模式从持久化数据库读取备忘录。
+MORNING_PROMPT = """加载 personal-memo skill，生成一份个性化的早间行动计划（Asia/Shanghai）。
 
-列出所有未完成条目，并给出从当前时间开始未来 12 小时内最多 3 项建议执行顺序。
+先读取可用的稳定上下文：SOUL.md、用户画像、长期记忆；再读取活动备忘录、链接来源摘要、最近完成记录和今天的时间。将这些材料仅用于贴合用户长期目标与工作方式，绝不虚构日程、精力、进展或事实。
 
-只允许读取、排序、生成提醒和更新本次列表编号快照。
+调用 memo_reminder(mode="morning") 建立当前活动事项快照；必要时再查询最近完成记录。不要机械复述完整列表。输出“今日焦点”（最多 3 项）：每项必须给出为何此刻优先、可立即执行的最小下一步，以及合适的开始时段或截止风险。可以指出一项适合主动延后的事项。信息不足时明确标注为推测。
 
-不得完成、删除、归档、改期、修改优先级或改变任何条目的业务状态。"""
+若没有活动事项、近期截止风险或真正有价值的建议，最终只回复 [SILENT]；否则用简洁中文输出计划。
 
-EVENING_PROMPT = MORNING_PROMPT.replace("早间提醒", "晚间提醒")
+只允许读取、排序、生成提醒和更新本次列表编号快照。不得完成、删除、归档、改期、修改优先级或改变任何条目的业务状态。"""
+
+EVENING_PROMPT = """加载 personal-memo skill，生成一份个性化的晚间收尾与明日准备计划（Asia/Shanghai）。
+
+先读取可用的稳定上下文：SOUL.md、用户画像、长期记忆；再读取活动备忘录、链接来源摘要、最近完成记录、明天的临近截止事项和当前时段。将这些材料仅用于贴合用户长期目标与工作方式，绝不虚构日程、精力、进展或事实。
+
+调用 memo_reminder(mode="evening") 建立当前活动事项快照；必要时再查询最近完成记录。输出“今晚收尾”（至多 2 项低摩擦、适合当前时段的最小行动）和“明日准备”（至多 2 项）。说明为何建议现在做或留到明天；对临近截止或长期搁置但与用户目标高度相关的事项给出温和提示。不要机械复述完整列表，信息不足时明确标注为推测。
+
+若没有活动事项、临近截止风险或真正有价值的建议，最终只回复 [SILENT]；否则用简洁中文输出计划。
+
+只允许读取、排序、生成提醒和更新本次列表编号快照。不得完成、删除、归档、改期、修改优先级或改变任何条目的业务状态。"""
 
 DISPATCH_PROMPT = """加载 personal-memo skill，从持久化数据库分发已经到期的精确时间提醒。
 
@@ -165,6 +175,17 @@ def normalize_temporal(
         return text, precision or "date"
     parsed = parse_datetime(text, timezone)
     return parsed.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat(), precision or "datetime"
+
+
+def normalize_deadline(value: str | None, timezone: str, precision: str | None = None) -> tuple[str | None, str | None]:
+    """Normalize a deadline; date-only input means local midnight (not end-of-day)."""
+    normalized, inferred = normalize_temporal(value, timezone, precision)
+    if normalized and inferred == "date" and re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+        local_midnight = dt.datetime.combine(
+            dt.date.fromisoformat(normalized), dt.time.min, check_timezone(timezone)
+        )
+        return local_midnight.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat(), "datetime"
+    return normalized, inferred
 
 
 def truncate(text: str | None, limit: int) -> str:
@@ -395,6 +416,17 @@ CREATE TABLE IF NOT EXISTS reminder_runs (
     success_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS item_reminders (
+    reminder_id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    remind_at TEXT NOT NULL,
+    remind_precision TEXT NOT NULL CHECK (remind_precision IN ('date','datetime','uncertain')),
+    offset_hours INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(item_id, remind_at)
+);
+
 CREATE INDEX IF NOT EXISTS idx_items_status_due ON items(status, due_at);
 CREATE INDEX IF NOT EXISTS idx_items_completed ON items(completed_at);
 CREATE INDEX IF NOT EXISTS idx_sources_item ON sources(item_id);
@@ -406,6 +438,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency ON item_events(idempote
     WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_snapshots_scope_created ON view_snapshots(scope_key, created_at);
 CREATE INDEX IF NOT EXISTS idx_reminder_due ON items(status, remind_at, remind_precision);
+CREATE INDEX IF NOT EXISTS idx_item_reminders_due ON item_reminders(remind_at, remind_precision);
 CREATE INDEX IF NOT EXISTS idx_reminder_dedupe ON reminder_runs(dedupe_key, delivery_status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reminder_success ON reminder_runs(dedupe_key)
     WHERE dedupe_key IS NOT NULL AND delivery_status='success';
@@ -768,15 +801,20 @@ class MemoStore:
             with transaction(conn):
                 conn.execute("DROP TABLE IF EXISTS items_v3")
                 conn.execute(ITEMS_TABLE_SQL.replace("IF NOT EXISTS items", "items_v3", 1))
+                title_expression = (
+                    "COALESCE(NULLIF(source_summary,''),title)"
+                    if "source_summary" in self._column_names(conn, "items")
+                    else "title"
+                )
                 conn.execute(
-                    """INSERT INTO items_v3(
+                    f"""INSERT INTO items_v3(
                         id,title,content,item_type,status,created_at,updated_at,
                         due_at,due_precision,due_raw_text,remind_at,remind_precision,
                         scheduled_for,scheduled_precision,defer_until,defer_precision,
                         timezone,priority_level,priority_source,priority_reason,
                         completed_at,deleted_at,archived_at,capture_source,tags_json,time_uncertain
                     )
-                    SELECT id,COALESCE(NULLIF(source_summary,''),title),content,item_type,status,
+                    SELECT id,{title_expression},content,item_type,status,
                            created_at,updated_at,due_at,due_precision,due_raw_text,
                            remind_at,remind_precision,scheduled_for,scheduled_precision,
                            defer_until,defer_precision,timezone,priority_level,priority_source,
@@ -793,6 +831,26 @@ class MemoStore:
                 )
         finally:
             conn.execute("PRAGMA foreign_keys=ON")
+
+    def _migrate_v3_to_v4(self) -> None:
+        """Add multiple deadline reminders while preserving legacy remind_at."""
+        assert self.conn is not None
+        conn = self.conn
+        with transaction(conn):
+            conn.execute("""CREATE TABLE IF NOT EXISTS item_reminders(
+                reminder_id TEXT PRIMARY KEY,
+                item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                remind_at TEXT NOT NULL,
+                remind_precision TEXT NOT NULL CHECK(remind_precision IN ('date','datetime','uncertain')),
+                offset_hours INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE(item_id,remind_at))""")
+            conn.execute("""INSERT OR IGNORE INTO item_reminders
+                (reminder_id,item_id,remind_at,remind_precision,offset_hours,created_at,updated_at)
+                SELECT 'R-'||lower(hex(randomblob(16))),id,remind_at,remind_precision,NULL,created_at,updated_at
+                FROM items WHERE remind_at IS NOT NULL""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_item_reminders_due ON item_reminders(remind_at,remind_precision)")
+            conn.execute("PRAGMA user_version=4")
+            conn.execute("INSERT OR REPLACE INTO schema_migrations(version,applied_at,description) VALUES(?,?,?)", (4, iso_now(), "Added multiple deadline reminders"))
 
     def _secure_files(self) -> None:
         for path in (self.paths.db_path, Path(str(self.paths.db_path) + "-wal"), Path(str(self.paths.db_path) + "-shm")):
@@ -860,15 +918,21 @@ class MemoStore:
                     (
                         (1, iso_now(), "Initial personal-memo schema"),
                         (2, iso_now(), "Active link items, time precision, item_sources, idempotency, and exact reminders"),
+                        (3, iso_now(), "Merged source_summary into items.title and removed the redundant column"),
+                        (4, iso_now(), "Added multiple deadline reminders"),
                     ),
                 )
             current = SCHEMA_VERSION
-        elif current == 1:
-            self._migrate_v1_to_v2()
-            current = 2
-        elif current == 2:
-            self._migrate_v2_to_v3()
-            current = SCHEMA_VERSION
+        else:
+            if current == 1:
+                self._migrate_v1_to_v2()
+                current = 2
+            if current == 2:
+                self._migrate_v2_to_v3()
+                current = 3
+            if current == 3:
+                self._migrate_v3_to_v4()
+                current = SCHEMA_VERSION
         defaults = {
             "timezone": DEFAULT_TIMEZONE,
             "capture_mode": "conservative",
@@ -1061,6 +1125,13 @@ class MemoStore:
                 data["key_points"] = parse_json(data.get("key_points"), [])
                 sources.append(data)
             result["sources"] = sources
+        reminders = []
+        for reminder in self.conn.execute(
+            "SELECT reminder_id,remind_at,remind_precision,offset_hours,created_at,updated_at FROM item_reminders WHERE item_id=? ORDER BY remind_at",
+            (item_id,),
+        ):
+            reminders.append(dict(reminder))
+        result["reminders"] = reminders
         return result
 
     def _record_event(
@@ -1152,7 +1223,7 @@ class MemoStore:
             return replay
         timezone = timezone or self._timezone()
         check_timezone(timezone)
-        due_at, due_precision = normalize_temporal(due_at, timezone, due_precision)
+        due_at, due_precision = normalize_deadline(due_at, timezone, due_precision)
         remind_at, remind_precision = normalize_temporal(remind_at, timezone, remind_precision)
         scheduled_for, scheduled_precision = normalize_temporal(scheduled_for, timezone, scheduled_precision)
         defer_until, defer_precision = normalize_temporal(defer_until, timezone, defer_precision)
@@ -1271,9 +1342,34 @@ class MemoStore:
                 idempotency_key=idempotency_key,
             )
         result = self._row_item(item_id)
+        self.sync_deadline_reminders(item_id)
+        result = self._row_item(item_id)
         result["event_id"] = event_id
         result["duplicate"] = False
         return result
+
+    def sync_deadline_reminders(self, item_id: str) -> list[dict[str, Any]]:
+        """Create the standard five-hour and one-hour deadline reminders."""
+        assert self.conn is not None
+        item = self._row_item(item_id, include_sources=False)
+        now = iso_now()
+        reminders = []
+        if item.get("due_at"):
+            due = parse_datetime(str(item["due_at"]), str(item["timezone"]))
+            for hours in (5, 1):
+                remind = due - dt.timedelta(hours=hours)
+                reminders.append((remind.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat(), hours))
+        elif item.get("remind_at"):
+            reminders.append((str(item["remind_at"]), None))
+        self.prewrite_backup()
+        with transaction(self.conn):
+            self.conn.execute("DELETE FROM item_reminders WHERE item_id=?", (item_id,))
+            for remind_at, hours in reminders:
+                self.conn.execute(
+                    "INSERT INTO item_reminders(reminder_id,item_id,remind_at,remind_precision,offset_hours,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    ("IR-" + uuid.uuid4().hex.upper(), item_id, remind_at, "datetime", hours, now, now),
+                )
+        return [{"remind_at": value, "offset_hours": hours} for value, hours in reminders]
 
     def capture(
         self,
@@ -1784,7 +1880,7 @@ class MemoStore:
         if before["priority_source"] == "user" and updates.get("priority_source") == "inferred":
             raise MemoError("An inferred priority cannot overwrite a user-set priority")
         if "due_at" in updates:
-            updates["due_at"], inferred_precision = normalize_temporal(
+            updates["due_at"], inferred_precision = normalize_deadline(
                 updates.get("due_at"), timezone, updates.get("due_precision")
             )
             updates["due_precision"] = inferred_precision
@@ -1839,6 +1935,8 @@ class MemoStore:
                 session_id=session_id,
                 idempotency_key=idempotency_key,
             )
+        if "due_at" in updates or "timezone" in updates:
+            self.sync_deadline_reminders(item_id)
         return self._row_item(item_id)
 
     def _transition(
@@ -2372,33 +2470,38 @@ class MemoStore:
         skipped_pending = 0
         with transaction(self.conn):
             for item in candidates:
-                remind_at = item.get("remind_at")
-                if not remind_at or item.get("remind_precision") != "datetime":
-                    continue
-                remind_dt = parse_datetime(str(remind_at), str(item["timezone"])).astimezone(dt.timezone.utc)
-                if remind_dt > now_utc:
-                    continue
-                dedupe = self._reminder_dedupe_key(str(item["id"]), str(remind_at), delivery_target)
-                success = self.conn.execute(
-                    "SELECT 1 FROM reminder_runs WHERE dedupe_key=? AND delivery_status='success'",
-                    (dedupe,),
-                ).fetchone()
-                if success:
-                    continue
-                pending = self.conn.execute(
-                    """SELECT attempted_at FROM reminder_runs
-                       WHERE dedupe_key=? AND delivery_status='pending'
-                       ORDER BY attempted_at DESC LIMIT 1""",
-                    (dedupe,),
-                ).fetchone()
-                if pending and pending["attempted_at"]:
-                    attempted = parse_datetime(str(pending["attempted_at"]), self._timezone()).astimezone(dt.timezone.utc)
-                    if attempted > lease_cutoff:
-                        skipped_pending += 1
+                reminder_rows = self.conn.execute(
+                    "SELECT remind_at,remind_precision FROM item_reminders WHERE item_id=? ORDER BY remind_at",
+                    (item["id"],),
+                ).fetchall()
+                for reminder_row in reminder_rows:
+                    remind_at = reminder_row["remind_at"]
+                    if not remind_at or reminder_row["remind_precision"] != "datetime":
                         continue
-                prepared_at = now_utc.replace(microsecond=0).isoformat()
-                prepared_run = "R-" + uuid.uuid4().hex.upper()
-                self.conn.execute(
+                    remind_dt = parse_datetime(str(remind_at), str(item["timezone"])).astimezone(dt.timezone.utc)
+                    if remind_dt > now_utc:
+                        continue
+                    dedupe = self._reminder_dedupe_key(str(item["id"]), str(remind_at), delivery_target)
+                    success = self.conn.execute(
+                        "SELECT 1 FROM reminder_runs WHERE dedupe_key=? AND delivery_status='success'",
+                        (dedupe,),
+                    ).fetchone()
+                    if success:
+                        continue
+                    pending = self.conn.execute(
+                        """SELECT attempted_at FROM reminder_runs
+                           WHERE dedupe_key=? AND delivery_status='pending'
+                           ORDER BY attempted_at DESC LIMIT 1""",
+                        (dedupe,),
+                    ).fetchone()
+                    if pending and pending["attempted_at"]:
+                        attempted = parse_datetime(str(pending["attempted_at"]), self._timezone()).astimezone(dt.timezone.utc)
+                        if attempted > lease_cutoff:
+                            skipped_pending += 1
+                            continue
+                    prepared_at = now_utc.replace(microsecond=0).isoformat()
+                    prepared_run = "R-" + uuid.uuid4().hex.upper()
+                    self.conn.execute(
                     """INSERT INTO reminder_runs(
                         run_id,mode,started_at,item_count,delivery_target,delivery_status,is_test,
                         item_id,remind_at,dedupe_key,attempted_at
@@ -2408,10 +2511,11 @@ class MemoStore:
                         item["id"], remind_at, dedupe, prepared_at,
                     ),
                 )
-                prepared = dict(item)
-                prepared["delivery_run_id"] = prepared_run
-                prepared["delivery_key"] = dedupe
-                due.append(prepared)
+                    prepared = dict(item)
+                    prepared["delivery_run_id"] = prepared_run
+                    prepared["delivery_key"] = dedupe
+                    prepared["remind_at"] = remind_at
+                    due.append(prepared)
         snapshot_id = self.create_snapshot(
             due,
             platform=platform,
@@ -2584,7 +2688,7 @@ class MemoStore:
         issues: list[str] = []
         required_tables = {
             "items", "sources", "item_sources", "item_events", "view_snapshots",
-            "settings", "schema_migrations", "reminder_runs",
+            "settings", "schema_migrations", "reminder_runs", "item_reminders",
         }
         actual_tables = {
             str(row[0])
@@ -3239,6 +3343,11 @@ def _render_item(item: dict[str, Any], number: int | None = None) -> str:
         lines.append(f"计划时间：{MemoStore._display_time(item, 'scheduled_for')}")
     if item.get("remind_at"):
         lines.append(f"提醒时间：{MemoStore._display_time(item, 'remind_at')}")
+    for reminder in item.get("reminders", []):
+        if reminder.get("remind_at"):
+            offset = reminder.get("offset_hours")
+            label = f"提前{offset}小时提醒" if offset else "提醒"
+            lines.append(f"{label}：{reminder['remind_at']}")
     return "\n".join(lines)
 
 
@@ -3327,7 +3436,6 @@ def render_markdown_list(items: Sequence[dict[str, Any]], *, heading: str = "当
         return "没有匹配的事项。"
     type_labels = {"task": "待办", "note": "笔记", "link": "链接", "article": "文章", "video": "视频", "reference": "参考资料"}
     priority_labels = {"urgent": "紧急", "high": "高", "normal": "普通", "low": "低"}
-    status_labels = {"active": "未完成", "completed": "已完成", "deleted": "已删除", "archived": "已归档"}
     lines = [f"**{heading}（{len(items)} 项）**", ""]
     for index, item in enumerate(items, start=1):
         summary = item.get("title") or "—"
@@ -3339,7 +3447,6 @@ def render_markdown_list(items: Sequence[dict[str, Any]], *, heading: str = "当
             f"- 类型：{type_labels.get(str(item.get('item_type')), str(item.get('item_type') or '—'))}",
             f"- 截止时间：{due}",
             f"- 优先级：{priority_labels.get(str(item.get('priority_level')), str(item.get('priority_level') or '—'))}",
-            f"- 状态：{status_labels.get(str(item.get('status')), str(item.get('status') or '—'))}",
             f"- 内容：{item.get('content') or '—'}",
             "",
         ])

@@ -65,7 +65,7 @@ The database is the only source of truth. The implementation enables:
 
 Never edit the database manually, run ad-hoc SQL from the model, or treat Markdown exports as writable state.
 
-## Schema version 2
+## Schema version 4
 
 The logical tables are:
 
@@ -79,6 +79,7 @@ The logical tables are:
 | `settings` | Timezone, capture mode, TTL, and data directory |
 | `schema_migrations` | Applied schema versions |
 | `reminder_runs` | Reminder generation and delivery observations |
+| `item_reminders` | Multiple exact reminders associated with one item |
 
 ## Items
 
@@ -96,7 +97,7 @@ The logical tables are:
 | `due_at` | Due date or due timestamp |
 | `due_precision` | `date`, `datetime`, `uncertain`, or null |
 | `due_raw_text` | User's original time phrase |
-| `remind_at` | Notification date/time |
+| `remind_at` | Legacy/single notification date/time; deadline-derived reminders use `item_reminders` |
 | `remind_precision` | `date`, `datetime`, `uncertain`, or null |
 | `scheduled_for` | Planned work date/time |
 | `scheduled_precision` | `date`, `datetime`, `uncertain`, or null |
@@ -215,6 +216,10 @@ Default settings:
 `capture_mode` may be `conservative` or `proactive`. Validate IANA timezones through `zoneinfo`.
 
 `schema_migrations` records the version, timestamp, and description. Version 2 migrates every legacy link item from `processing` to `active`, preserves source processing state, backfills `item_sources`, and adds precise reminder/idempotency fields. Before every migration, create a versioned timestamp backup. Roll back failed migrations and never initialize over a newer unknown schema or clear user data to fix a migration.
+
+## Item reminders
+
+`item_reminders` stores multiple exact reminders for one item. When an explicit deadline is present, the capture policy creates reminders five hours and one hour before it; `offset_hours` records the rule used.
 
 ## Reminder runs
 

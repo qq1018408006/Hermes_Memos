@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +36,16 @@ class FakeContext:
 
     def register_command(self, name, handler, description):
         self.commands[name] = handler
+
+
+class FakeStructuredLLM:
+    def __init__(self, parsed):
+        self.parsed = parsed
+        self.calls = []
+
+    def complete_structured(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(parsed=self.parsed, text="")
 
 
 class HermesPluginTestCase(unittest.TestCase):
@@ -104,15 +115,43 @@ class HermesPluginTestCase(unittest.TestCase):
         self.assertTrue(accepted["ok"], accepted)
         self.assertTrue(accepted["result"]["purged"])
 
-    def test_memos_command_returns_a_core_rendered_markdown_table(self):
+    def test_memos_command_returns_a_core_rendered_markdown_list(self):
         self.invoke(plugin.tools.memo_add, {"title": "Table item", "content": "Table item"})
         context = FakeContext()
         plugin.register(context)
         table = context.commands["memos"]("")
-        self.assertIn("**1. —**", table)
+        self.assertIn("**1. Table item**", table)
         self.assertIn("- 内容：Table item", table)
         self.assertNotIn("| # |", table)
         self.assertIn("Table item", table)
+
+    def test_saved_item_analysis_is_shared_and_uses_parsed_link_context(self):
+        store, _ = plugin.store.get_store()
+        item = store.add_item(
+            title="Initial", content="Read https://example.com/article", item_type="link",
+            urls=["https://example.com/article"], allow_duplicate=True,
+        )
+        source_id = item["sources"][0]["source_id"]
+        store.update_source(source_id, {
+            "source_title": "Example research", "summary": "A substantive parsed source summary.",
+            "key_points": ["First source point"], "ingest_status": "complete",
+            "understanding_basis": "title_and_description",
+        })
+        store.retry_source = lambda reference: {"processed": 1}  # type: ignore[method-assign]
+        parsed = {
+            "title": "Agent summary of the linked research", "item_type": "article",
+            "due_at": None, "due_precision": None, "due_raw_text": None,
+            "remind_at": None, "remind_precision": None,
+            "scheduled_for": None, "scheduled_precision": None,
+            "defer_until": None, "defer_precision": None,
+            "priority_level": "normal", "priority_reason": None, "time_uncertain": False,
+        }
+        llm = FakeStructuredLLM(parsed)
+        result = plugin._analyze_saved_item(SimpleNamespace(llm=llm), store, item)
+        self.assertEqual(result["title"], parsed["title"])
+        prompt = llm.calls[0]["input"][0]["text"]
+        self.assertIn("A substantive parsed source summary.", prompt)
+        self.assertIn("First source point", prompt)
 
     def test_admin_timezone_migration_uses_shanghai_without_moving_instants(self):
         added = self.invoke(plugin.tools.memo_add, {

@@ -141,10 +141,10 @@ class MemoTestCase(unittest.TestCase):
         ids = [item["id"] for item in self.store.list_items(create_snapshot=False)["items"]]
         self.assertEqual(ids, [urgent["id"], normal["id"]])
 
-    def test_08_date_due_is_not_exact_time(self):
+    def test_08_date_due_means_local_midnight(self):
         item = self.add("Date only", due_at="2999-02-03")
-        self.assertEqual(item["due_precision"], "date")
-        self.assertIn("未指定具体时间", memo.MemoStore._display_time(item, "due_at"))
+        self.assertEqual(item["due_precision"], "datetime")
+        self.assertIn("00:00", memo.MemoStore._display_time(item, "due_at"))
 
     def test_09_due_reminder_and_schedule_are_distinct(self):
         item = self.add(
@@ -676,7 +676,7 @@ class MemoTestCase(unittest.TestCase):
                 SELECT id,title,content,item_type,'processing',created_at,updated_at,
                        due_at,due_precision,due_raw_text,remind_at,scheduled_for,defer_until,
                        timezone,priority_level,priority_source,priority_reason,completed_at,
-                       deleted_at,archived_at,source_summary,capture_source,tags_json,time_uncertain
+                       deleted_at,archived_at,title,capture_source,tags_json,time_uncertain
                 FROM items;
                 DROP TABLE items;
                 ALTER TABLE items_v1 RENAME TO items;
@@ -690,8 +690,8 @@ class MemoTestCase(unittest.TestCase):
                 restored = migrated.show(item_id)
                 self.assertEqual(restored["status"], "active")
                 self.assertEqual(restored["sources"][0]["ingest_status"], "processing")
-                self.assertEqual(migrated.validate()["schema_version"], 2)
-                self.assertTrue(list(paths.backups_dir.glob("migration-v1-*.sqlite3")))
+                self.assertEqual(migrated.validate()["schema_version"], memo.SCHEMA_VERSION)
+                self.assertTrue(list(paths.backups_dir.glob("migration-v*.sqlite3")))
             finally:
                 migrated.close()
 
@@ -749,7 +749,7 @@ class MemoTestCase(unittest.TestCase):
         self.store.prewrite_backups = True
         self.add("First daily write")
         self.add("Second daily write")
-        self.assertEqual(len(list(self.paths.backups_dir.glob("daily-v2-*.sqlite3"))), 1)
+        self.assertEqual(len(list(self.paths.backups_dir.glob("daily-v4-*.sqlite3"))), 1)
 
     def test_91_video_key_points_are_bounded(self):
         item = self.add("Video points", urls=["https://youtube.com/watch?v=x"])
